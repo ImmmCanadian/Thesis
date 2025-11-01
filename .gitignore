@@ -1,0 +1,15 @@
+@"
+*
+!.gitignore
+!/README.md
+!/requirements.txt
+!/dataset_and_pipelines.py
+!/lightning_modules.py
+!/model_detector.py
+!/model_classifiers.py
+!/train.py
+!/annotations/
+!/weights/
+weights/*
+!weights/hand_detect_best.pt
+"@ | Set-Content -Path .gitignore -Encoding UTF8

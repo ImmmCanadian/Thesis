@@ -1,0 +1,24 @@
+# Core model training
+torch>=2.3
+torchvision>=0.18
+pytorch-lightning>=2.3
+torchmetrics>=1.4
+
+# Data processing and feature extraction
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=0.10.14
+ultralytics>=8.2
+Pillow>=10.0
+pandas>=2.1
+scikit-learn>=1.4
+tqdm>=4.65
+PyYAML>=6.0
+
+# Logging and visualization
+tensorboard>=2.14
+matplotlib>=3.8
+seaborn>=0.13
+
+# Deployment and quantization
+openvino>=2024.2
