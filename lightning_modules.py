@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 from typing import Optional
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,7 @@ from torchmetrics.classification import (
 )
 
 from model_detector import ResLight10Detector
+from model_detector_tsm import ResLight10DetectorTSM
 from model_classifiers import MediaPipeLSTM, MediaPipeGRU, MediaPipeTCN
 from dataset_and_pipelines import IPNTwoStageDataset, DEFAULT_SAMPLE_SIZE
 
@@ -204,6 +205,13 @@ class ClassifierLightningModule(pl.LightningModule):
         return self.model(x)
 
     def _build_model(self, model_type, input_size, hidden_size, num_layers, dropout, num_classes):
+        projection_dim: Optional[int] = None
+        
+        if input_size > 100: # i.e. not mediapipe
+            projection_dim = hidden_size * 2
+        else:
+            projection_dim = None
+
         model_type = model_type.lower()
         if model_type == "gru":
             return MediaPipeGRU(
@@ -212,7 +220,7 @@ class ClassifierLightningModule(pl.LightningModule):
                 num_layers=num_layers,
                 dropout=dropout,
                 num_classes=num_classes,
-                projection_dim=640
+                projection_dim=projection_dim,
             )
         elif model_type == "lstm":
             return MediaPipeLSTM(
@@ -221,7 +229,7 @@ class ClassifierLightningModule(pl.LightningModule):
                 num_layers=num_layers,
                 dropout=dropout,
                 num_classes=num_classes,
-                projection_dim=640
+                projection_dim=projection_dim,
             )
         elif model_type == "tcn":
             return MediaPipeTCN(
@@ -230,7 +238,7 @@ class ClassifierLightningModule(pl.LightningModule):
                 num_levels=num_layers,
                 dropout=dropout,
                 num_classes=num_classes,
-                projection_dim=640
+                projection_dim=projection_dim,
             )
         else:
             raise ValueError(f"Unsupported temporal model type: {model_type}")
@@ -301,7 +309,25 @@ class ClassifierLightningModule(pl.LightningModule):
                 lr=self.hparams.lr,
                 weight_decay=self.hparams.weight_decay,
             )
-            return optimizer
+
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+            )
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                    "interval": "epoch",
+                    "frequency": 1,
+                    "reduce_on_plateau": True,
+                },
+            }
         
         elif optimizer_type == "sgd":
             optimizer = torch.optim.SGD(
@@ -426,7 +452,7 @@ class ClassifierLightningModule(pl.LightningModule):
                 for line in lines:
                     f.write(line + '\n')
         except Exception as e:
-            print(f"⚠️  Warning: Could not write metrics to file: {e}")
+            print(f"Warning: Could not write metrics to file: {e}")
     
     def on_train_end(self):
         """Write final training summary to metrics file."""
@@ -478,8 +504,9 @@ class TwoStageDataModule(pl.LightningDataModule):
         use_elastic_distortion: bool = False,
         val_split: float = 0.1,
         val_seed: int = 42,
-        multiprocessing_context=None
-        
+        multiprocessing_context=None,
+        use_extracted_frames: bool = False,
+        frames_root: str = "data/frames",
     ):
         super().__init__()
         assert stage in {"detector", "classifier"}, "stage must be 'detector' or 'classifier'"
@@ -503,6 +530,8 @@ class TwoStageDataModule(pl.LightningDataModule):
         self.val_split = max(0.0, val_split)
         self.val_seed = val_seed
         self.multiprocessing_context = multiprocessing_context
+        self.use_extracted_frames = use_extracted_frames
+        self.frames_root = frames_root
         
         
         if self.cache_dir:
@@ -527,7 +556,8 @@ class TwoStageDataModule(pl.LightningDataModule):
             features_cache_dir=self.features_cache_dir,
             include_background=self.include_background,
             use_elastic_distortion=self.use_elastic_distortion,
-            
+            use_extracted_frames=self.use_extracted_frames,
+            frames_root=self.frames_root,
         )
 
         if self.val_annotation is None:
@@ -591,6 +621,8 @@ class TwoStageDataModule(pl.LightningDataModule):
                 max_samples=self.max_val_samples,
                 include_background=self.include_background,
                 use_elastic_distortion=self.use_elastic_distortion,
+                use_extracted_frames=self.use_extracted_frames,
+                frames_root=self.frames_root,
             )
 
         self.feature_dim = getattr(self.train_dataset, "feature_dim", None)

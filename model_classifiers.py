@@ -11,6 +11,7 @@ class MediaPipeLSTM(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.dropout = dropout
         
         if projection_dim is not None:
             self.projection = nn.Sequential(
@@ -33,11 +34,11 @@ class MediaPipeLSTM(nn.Module):
         )
         
         self.classifier = nn.Sequential(
-        nn.Linear(hidden_size * 2, hidden_size),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(hidden_size, num_classes)
-    )
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(hidden_size, num_classes)
+        )
 
     def forward(self, x):
         if self.projection is not None:
@@ -65,33 +66,34 @@ class MediaPipeGRU(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        
+        self.dropout = dropout
+            
         if projection_dim is not None:
-            self.projection = nn.Sequential(
-                nn.Linear(input_size, projection_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            )
-            gru_input_size = projection_dim
+                self.projection = nn.Sequential(
+                    nn.Linear(input_size, projection_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+                gru_input_size = projection_dim
         else:
-            self.projection = None
-            gru_input_size = input_size
-        
+                self.projection = None
+                gru_input_size = input_size
+            
         self.gru = nn.GRU(
-            input_size=gru_input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=True,
-        )
-        
+                input_size=gru_input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0,
+                bidirectional=True,
+            )
+            
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_size, num_classes)
-        )
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(hidden_size, num_classes)
+            )
 
     def forward(self, x):
         if self.projection is not None:
@@ -138,6 +140,7 @@ class MediaPipeTCN(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.dropout = dropout
 
         if projection_dim is not None:
             self.projection = nn.Sequential(
@@ -162,11 +165,11 @@ class MediaPipeTCN(nn.Module):
         self.tcn = nn.Sequential(*layers)
         
         self.classifier = nn.Sequential(
-        nn.Linear(hidden_size, hidden_size // 2),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(hidden_size // 2, num_classes)
-    )
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(hidden_size // 2, num_classes)
+        )
 
     def forward(self, x):
         if self.projection is not None:

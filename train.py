@@ -91,6 +91,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--detector-use-extracted-frames",
+        action="store_true",
+        help="Use pre-extracted frames from data/frames/ instead of loading from videos. "
+             "Frames should be in data/frames/VIDEO_NAME/VIDEO_NAME_XXXXXX.jpg format. "
+             "This significantly speeds up training by avoiding video file I/O."
+    )
+    parser.add_argument(
+        "--frames-root",
+        type=str,
+        default="data/frames",
+        help="Root directory containing pre-extracted frames (default: data/frames)"
+    )
     parser.add_argument("--max-train-samples", type=int, default=None,
                         help="Limit number of training samples for quick smoke tests")
     parser.add_argument("--max-val-samples", type=int, default=None,
@@ -206,6 +219,8 @@ def train_two_stage_system(args: argparse.Namespace):
             max_val_samples=args.max_val_samples,
             val_split=args.val_split,
             val_seed=args.val_seed,
+            use_extracted_frames=args.detector_use_extracted_frames,
+            frames_root=args.frames_root,
         )
         
         detector_datamodule.setup("fit")
@@ -230,16 +245,24 @@ def train_two_stage_system(args: argparse.Namespace):
         if detector_progress is not None:
             callbacks.append(detector_progress)
 
-        callbacks.extend([
-            ModelCheckpoint(
-                dirpath=output_dir / "detector",
-                filename="detector-{epoch:02d}-{val/loss:.4f}",
-                monitor="val/loss",
-                mode="min",
-                save_top_k=3,
-            ),
-            LearningRateMonitor(logging_interval='epoch'),
-        ])
+        detector_ckpt_dir = output_dir / "detector"
+        detector_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        detector_best_ckpt = ModelCheckpoint(
+            dirpath=detector_ckpt_dir,
+            filename="detector-best_{epoch:02d}_{val/loss:.4f}",
+            monitor="val/loss",
+            mode="min",
+            save_top_k=3,
+        )
+        detector_epoch_ckpt = ModelCheckpoint(
+            dirpath=detector_ckpt_dir,
+            filename="detector-epoch{epoch:02d}",
+            save_top_k=-1,
+            every_n_epochs=1,
+        )
+
+        callbacks.extend([detector_best_ckpt, detector_epoch_ckpt, LearningRateMonitor(logging_interval='epoch')])
         
         if args.early_stopping:
             callbacks.append(
@@ -375,16 +398,21 @@ def train_two_stage_system(args: argparse.Namespace):
         metrics_base = f"{args.temporal_model}_{args.num_layers}L_{args.hidden_size}HS_{args.optimizer_type}"
         classifier_subdir = output_dir / "classifier"
         os.makedirs(classifier_subdir, exist_ok=True)
-        callbacks.extend([
-            ModelCheckpoint(
-                dirpath=classifier_subdir,
-                filename=f"{metrics_base}_epoch{{epoch:02d}}_loss{{val/loss:.4f}}",
-                monitor="val/loss",
-                mode="min",
-                save_top_k=3,
-            ),
-            LearningRateMonitor(logging_interval='epoch'),
-        ])
+        best_classifier_ckpt = ModelCheckpoint(
+            dirpath=classifier_subdir,
+            filename=f"{metrics_base}_best_epoch{{epoch:02d}}_loss{{val/loss:.4f}}",
+            monitor="val/loss",
+            mode="min",
+            save_top_k=3,
+        )
+        epoch_classifier_ckpt = ModelCheckpoint(
+            dirpath=classifier_subdir,
+            filename=f"{metrics_base}_epoch{{epoch:02d}}",
+            save_top_k=-1,
+            every_n_epochs=1,
+        )
+
+        callbacks.extend([best_classifier_ckpt, epoch_classifier_ckpt, LearningRateMonitor(logging_interval='epoch')])
         
         if args.early_stopping:
             callbacks.append(

@@ -13,7 +13,14 @@ from typing import Optional, Dict, Tuple, Sequence
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode, functional as F
-from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
+from torchvision.models import (
+    mobilenet_v3_small,
+    MobileNet_V3_Small_Weights,
+    mobilenet_v3_large,
+    MobileNet_V3_Large_Weights,
+    mobilenet_v2,
+    MobileNet_V2_Weights,
+)
 from ultralytics import YOLO
 
 IPN_RGB_MEAN = [0.450097, 0.422493, 0.390098]
@@ -127,10 +134,12 @@ class YOLOMobileNetExtractor:
         self,
         detector_weights: str = "weights/hand_detect_best.pt",
         fallback_weights: str = "yolo11n.pt",
-        mobilenet_weights: MobileNet_V2_Weights = MobileNet_V2_Weights.IMAGENET1K_V1,
         device: Optional[torch.device] = None,
         use_fp16: bool = False,
-        
+        conf_thresh: float = 0.25,
+        target_size: int = 256,
+        mobilenet_variant: str = "v3_large_imagenet",
+        mobilenet_weights_path: Optional[str] = None,
     ):
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -139,7 +148,8 @@ class YOLOMobileNetExtractor:
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
         if use_fp16 and self.device.type != "cuda":
             warnings.warn("FP16 requested but CUDA device unavailable; running in FP32 instead.")
-        
+        self.conf_thresh = conf_thresh
+        self.target_size = target_size  
 
         self._yolo_device = self.device
 
@@ -151,7 +161,7 @@ class YOLOMobileNetExtractor:
             detector_weights_path = Path(fallback_weights)
 
         self.yolo_weights = detector_weights_path
-        # Load YOLO detector (PyTorch) for metadata and optional inference
+        # Load YOLO detector
         self.yolo = YOLO(str(self.yolo_weights))
         
         if not self.use_fp16:
@@ -163,18 +173,42 @@ class YOLOMobileNetExtractor:
         else:
             self._yolo_device = self.device
 
-        # Prepare MobileNetV2 for feature extraction
-        mobilenet = mobilenet_v2(weights=mobilenet_weights)
-        mobilenet.classifier = torch.nn.Identity()
+        imagenet_mean = [0.485, 0.456, 0.406]
+        imagenet_std = [0.229, 0.224, 0.225]
+
+        self.backbone = mobilenet_variant.lower()
+
+        if self.backbone == "v2_imagenet":
+            mobilenet = mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
+            mobilenet.classifier = torch.nn.Identity()
+            mobilenet.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+            self.feature_dim = 1280
+            norm_mean, norm_std = imagenet_mean, imagenet_std
+
+        elif self.backbone == "v3_small_imagenet":
+            mobilenet = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+            mobilenet.classifier = torch.nn.Identity()
+            mobilenet.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+            self.feature_dim = 576
+            norm_mean, norm_std = imagenet_mean, imagenet_std
+
+        elif self.backbone == "v3_large_imagenet":
+            mobilenet = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
+            mobilenet.classifier = torch.nn.Identity()
+            mobilenet.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+            self.feature_dim = 960
+            norm_mean, norm_std = imagenet_mean, imagenet_std
+
+        else:
+            raise ValueError(f"Unsupported MobileNet variant: {mobilenet_variant}")
+
         mobilenet.eval()
         self.mobilenet = mobilenet.to(self.device)
-        self.pool = torch.nn.AdaptiveAvgPool2d((1, 1))
 
-        # Store normalization parameters as tensors for faster processing
-        self.register_buffer('imagenet_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer('imagenet_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-        self.feature_dim = 1280
+        self.register_buffer('norm_mean', torch.tensor(norm_mean).view(1, 3, 1, 1))
+        self.register_buffer('norm_std', torch.tensor(norm_std).view(1, 3, 1, 1))
+        
+        
 
     def register_buffer(self, name, tensor):
         setattr(self, name, tensor.to(self.device))
@@ -220,20 +254,47 @@ class YOLOMobileNetExtractor:
         return (x1_int, y1_int, x2_int, y2_int)
 
     def fast_mobilenet_preprocess(self, crop_bgr: np.ndarray) -> torch.Tensor:
-        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        
+        h, w = crop_bgr.shape[:2]
+        target_size = self.target_size
+        
+        # Calculate scale to fit inside target_size while preserving aspect ratio
+        scale = target_size / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize preserving aspect ratio
+        resized = cv2.resize(crop_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Create gray canvas 
+        canvas = np.full((target_size, target_size, 3), 127, dtype=np.uint8)
+        
+        # Center the resized crop on canvas
+        y_offset = (target_size - new_h) // 2
+        x_offset = (target_size - new_w) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+        
+        # Convert BGR to RGB
+        crop_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         crop_float = crop_rgb.astype(np.float32) / 255.0
+        
+        # Convert to tensor
         tensor = torch.from_numpy(crop_float).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        tensor = F.resize(tensor, [224, 224], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        tensor = (tensor - self.imagenet_mean) / self.imagenet_std
+
+        tensor = (tensor - self.norm_mean) / self.norm_std
+
         if self.use_fp16:
             tensor = tensor.half()
+        
         return tensor
 
     def extract_with_box(self, frame: np.ndarray, return_timings: bool = False):
+        
         total_start = time.perf_counter()
         detect_start = total_start
         
-        results = self.yolo.predict(frame, verbose=False, imgsz=640)
+        # YOLO detection (keep as BGR, don't convert to RGB)
+        results = self.yolo.predict(frame, verbose=False, imgsz=640, conf=0.001)
         result = results[0] if len(results) > 0 else None
         detect_time = time.perf_counter() - detect_start
 
@@ -241,12 +302,25 @@ class YOLOMobileNetExtractor:
         if result is not None:
             box = self._select_hand_box(result, frame.shape)
 
+        # Extract crop if valid box exists
+        crop_bgr = None
         if box is not None:
             x1, y1, x2, y2 = box
             crop_bgr = frame[y1:y2, x1:x2]
-            if crop_bgr.size == 0 or crop_bgr.shape[0] < 2 or crop_bgr.shape[1] < 2:
-                crop_bgr = frame
+            
+            # Filter out crops that are too small (< 100px in either dimension)
+            h, w = crop_bgr.shape[:2]
+            if h < 100 or w < 100:
+                # Reject small crops, hands coming into or out of frame
+                crop_bgr = None
+                box = None
 
+        # If no valid crop, return zero features
+        if crop_bgr is None or crop_bgr.size == 0:
+            embedding = np.zeros(self.feature_dim, dtype=np.float32)
+            mobilenet_time = 0.0
+        else:
+            # Valid crop - extract MobileNet features
             mobilenet_start = time.perf_counter()
             tensor = self.fast_mobilenet_preprocess(crop_bgr)
 
@@ -260,10 +334,9 @@ class YOLOMobileNetExtractor:
 
             embedding = features.squeeze(0).cpu().numpy().astype(np.float32)
             mobilenet_time = time.perf_counter() - mobilenet_start
-        else:
-            embedding = np.zeros(self.feature_dim, dtype=np.float32)
-            mobilenet_time = 0.0
+
         total_time = time.perf_counter() - total_start
+        
         timings = None
         if return_timings:
             timings = {
@@ -271,6 +344,7 @@ class YOLOMobileNetExtractor:
                 "mobilenet": mobilenet_time,
                 "total": total_time,
             }
+        
         return embedding, box, timings
     
     def runtime_devices(self) -> Dict[str, str]:
@@ -306,12 +380,16 @@ class IPNTwoStageDataset(Dataset):
         include_background: bool = False,
         use_elastic_distortion: bool = False,
         subset_indices: Optional[Sequence[int]] = None,
+        use_extracted_frames: bool = False,
+        frames_root: str = "data/frames",
     ):
         self.detector_window = detector_window
         self.classifier_window = classifier_window
         self.stride = stride
         self.mode = mode
         self.video_root = Path(video_root)
+        self.use_extracted_frames = use_extracted_frames
+        self.frames_root = Path(frames_root) if frames_root else None
         self.stage = stage
         self.feature_type = feature_type
         self.cache_dir = None
@@ -523,7 +601,7 @@ class IPNTwoStageDataset(Dataset):
                         samples.append({
                             'video': video, 
                             'start': ann['start'], 
-                            'end': ann['end'] + 1,  # ✅ FIX #4: Make end exclusive (annotations are inclusive)
+                            'end': ann['end'] + 1,  
                             'label': class_map[ann['class_id']],
                             'is_short': True  # Mark for padding
                         })
@@ -573,6 +651,11 @@ class IPNTwoStageDataset(Dataset):
 
     # Load preprocessed clip tensors for detector training
     def _load_clip(self, video, start, end):
+        # Use extracted frames only for detector stage when flag is enabled
+        if self.use_extracted_frames and self.stage == 'detector':
+            return self._load_clip_from_frames(video, start, end)
+        
+        # Default: Load from video file
         video_path = self.video_root / (video + '.avi')
         cap = cv2.VideoCapture(str(video_path))
         frames = []
@@ -623,6 +706,70 @@ class IPNTwoStageDataset(Dataset):
         cap.release()
         return frames
 
+    # Load pre-extracted frames for detector training
+    def _load_clip_from_frames(self, video, start, end):
+        """Load preprocessed clip from pre-extracted frames on disk (DETECTOR ONLY)."""
+        frames_dir = self.frames_root / video
+        if not frames_dir.exists():
+            raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
+        
+        frames = []
+        transform = self.frame_transform
+        
+        for i in range(start, end):
+            # Frame naming: VIDEO_NAME_XXXXXX.jpg (1-indexed, 6 digits)
+            frame_path = frames_dir / f"{video}_{i+1:06d}.jpg"
+            
+            if not frame_path.exists():
+                # Fallback: try with 5 digits in case frame numbering differs
+                frame_path_alt = frames_dir / f"{video}_{i+1:05d}.jpg"
+                if not frame_path_alt.exists():
+                    # If frame doesn't exist, use fallback
+                    fallback = np.zeros((self.sample_size, self.sample_size, 3), dtype=np.uint8)
+                    if transform is not None:
+                        if hasattr(transform, "randomize_parameters") and not frames:
+                            transform.randomize_parameters(fallback)
+                        frame_tensor = transform(fallback)
+                    else:
+                        frame_tensor = torch.zeros(3, self.sample_size, self.sample_size)
+                    frames.append(frame_tensor)
+                    continue
+                frame_path = frame_path_alt
+            
+            # Read frame
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                # Handle read failure
+                fallback = np.zeros((self.sample_size, self.sample_size, 3), dtype=np.uint8)
+                if transform is not None:
+                    if hasattr(transform, "randomize_parameters") and not frames:
+                        transform.randomize_parameters(fallback)
+                    frame_tensor = transform(fallback)
+                else:
+                    frame_tensor = torch.zeros(3, self.sample_size, self.sample_size)
+                frames.append(frame_tensor)
+                continue
+            
+            # Convert BGR to RGB (cv2 loads as BGR)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Apply transform
+            if transform is not None:
+                if hasattr(transform, "randomize_parameters") and not frames:
+                    transform.randomize_parameters(frame_rgb)
+                frame_tensor = transform(frame_rgb)
+            else:
+                resized = cv2.resize(frame_rgb, (self.sample_size, self.sample_size))
+                frame_tensor = torch.from_numpy(resized.astype(np.float32) / 255.0).permute(2, 0, 1)
+            
+            frames.append(frame_tensor)
+        
+        if transform is not None and hasattr(transform, "clear_parameters"):
+            transform.clear_parameters()
+        
+        clip = torch.stack(frames, dim=0)  # (T, C, H, W)
+        return clip
+
     # Extract or retrieve feature embeddings for classifier stage
     def _extract_features(self, video, start, end):
         """Extract features for a video segment, using cache if available."""
@@ -654,7 +801,9 @@ class IPNTwoStageDataset(Dataset):
         if self.feature_extractor is None:
             raise RuntimeError("Feature extractor not initialized and no cached features available")
         
+        # Classifier always loads from video files (not extracted frames)
         raw_frames = self._load_raw_clip(video, start, end)
+        
         features = []
         for frame in raw_frames:
             if hasattr(self.feature_extractor, "extract_with_box"):
